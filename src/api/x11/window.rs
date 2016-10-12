@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::os::raw::c_long;
 use std::thread;
 use std::time::Duration;
+use std::ffi::CString;
 
 use Api;
 use ContextError;
@@ -310,11 +311,23 @@ impl Window {
                pf_reqs: &PixelFormatRequirements, opengl: &GlAttributes<&Window>)
                -> Result<Window, CreationError>
     {
+
+        let screen_id = match window_attrs.monitor {
+            Some(PlatformMonitorId::X(MonitorId(_, monitor))) => monitor as i32,
+            _ => unsafe { (display.xlib.XDefaultScreen)(display.display) },
+        };
+
+        let statusbar = true;
+
+        let mut screen_height = 0;
+        let mut screen_width = 0;
+
         let dimensions = {
 
             // x11 only applies constraints when the window is actively resized
             // by the user, so we have to manually apply the initial constraints
             let mut dimensions = window_attrs.dimensions.unwrap_or((800, 600));
+
             if let Some(max) = window_attrs.max_dimensions {
                 dimensions.0 = cmp::min(dimensions.0, max.0);
                 dimensions.1 = cmp::min(dimensions.1, max.1);
@@ -324,13 +337,19 @@ impl Window {
                 dimensions.0 = cmp::max(dimensions.0, min.0);
                 dimensions.1 = cmp::max(dimensions.1, min.1);
             }
+
+            if statusbar {
+                unsafe {
+                    let d = display.display;
+                    let screen = (display.xlib.XScreenOfDisplay)(d, screen_id);
+                    screen_width = (display.xlib.XWidthOfScreen)(screen);
+                    screen_height = (display.xlib.XHeightOfScreen)(screen);
+                }
+
+                dimensions.0 = screen_width as u32;
+            }
+
             dimensions
-
-        };
-
-        let screen_id = match window_attrs.monitor {
-            Some(PlatformMonitorId::X(MonitorId(_, monitor))) => monitor as i32,
-            _ => unsafe { (display.xlib.XDefaultScreen)(display.display) },
         };
 
         // finding the mode to switch to if necessary
@@ -455,13 +474,43 @@ impl Window {
 
         // finally creating the window
         let window = unsafe {
-            let win = (display.xlib.XCreateWindow)(display.display, root, 0, 0, dimensions.0 as libc::c_uint,
+            let win = (display.xlib.XCreateWindow)(display.display, root, screen_width, screen_height, dimensions.0 as libc::c_uint,
                 dimensions.1 as libc::c_uint, 0, visual_infos.depth, ffi::InputOutput as libc::c_uint,
                 visual_infos.visual as *mut _, window_attributes,
                 &mut set_win_attr);
             display.check_errors().expect("Failed to call XCreateWindow");
             win
         };
+
+        if statusbar {
+            // these calls must happen before setting visibility
+            let wm_window_type = CString::new("_NET_WM_WINDOW_TYPE").unwrap();
+            let wm_window_type_dock = CString::new("_NET_WM_WINDOW_TYPE_DOCK").unwrap();
+            let wm_window_type_atom;
+            let wm_window_type_dock_atom;
+            unsafe {
+                wm_window_type_atom = (display.xlib.XInternAtom)(
+                    display.display,
+                    wm_window_type.as_ptr(),
+                    ffi::False);
+
+                wm_window_type_dock_atom = (display.xlib.XInternAtom)(
+                    display.display,
+                    wm_window_type_dock.as_ptr(),
+                    ffi::False) as u32;
+
+
+                let window_type_dock_char_ptr =
+                    mem::transmute::<*const u32, *const u8>(&wm_window_type_dock_atom);
+
+                (display.xlib.XChangeProperty)(display.display, window,
+                                               wm_window_type_atom,
+                                               ffi::XA_ATOM,
+                                               32,
+                                               ffi::PropModeReplace,
+                                               window_type_dock_char_ptr, 1);
+            }
+        }
 
         // set visibility
         if window_attrs.visible {
@@ -512,8 +561,14 @@ impl Window {
             if ic.is_null() {
                 return Err(OsError(format!("XCreateIC failed")));
             }
-            (display.xlib.XSetICFocus)(ic);
-            display.check_errors().expect("Failed to call XSetICFocus");
+
+            // we don't want to focus if statusbar mode == true
+            if !statusbar {
+
+                (display.xlib.XSetICFocus)(ic);
+                display.check_errors().expect("Failed to call XSetICFocus");
+            }
+
             ic
         };
 
@@ -524,8 +579,8 @@ impl Window {
             if supported_ptr == ffi::False {
                 return Err(OsError(format!("XkbSetDetectableAutoRepeat failed")));
             }
-        }
 
+        }
         // Set ICCCM WM_CLASS property based on initial window title
         unsafe {
             with_c_str(&*window_attrs.title, |c_name| {
@@ -538,7 +593,7 @@ impl Window {
             });
         }
 
-        let is_fullscreen = window_attrs.monitor.is_some();
+        let is_fullscreen = window_attrs.monitor.is_some() && !statusbar;
 
         if is_fullscreen {
             let state_atom = unsafe {
